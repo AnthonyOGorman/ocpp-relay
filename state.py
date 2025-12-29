@@ -1,6 +1,7 @@
 import collections
 import dataclasses
 import logging
+import os
 import threading
 import time
 import uuid
@@ -18,8 +19,11 @@ class Event:
     response: Optional[str] = None
 
 
-_redis = redis.Redis(decode_responses=True)
-
+_redis = redis.Redis(
+    host=os.getenv("REDIS_HOST", "redis"),
+    port=int(os.getenv("REDIS_PORT", 6379)),
+    decode_responses=True
+)
 
 class RedisBackedAttr:
     def __init__(self, key, data_type, default=None):
