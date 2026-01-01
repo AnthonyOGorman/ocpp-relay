@@ -2,12 +2,14 @@ import asyncio
 import base64
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
 
 import websockets
 from dataclasses_json import dataclass_json
+from state import AppState
 
 
 def setup_logger():
@@ -47,6 +49,40 @@ class WebSocketRelay:
         self.csms_url, self.csms_id, self.csms_pass = None, None, None
         self.csms_ws, self.cp_ws = None, None
         self.cp_id, cp_ws_subp = None, None
+
+    async def load_csms_from_redis(self) -> bool:
+        state = AppState.instantiate()
+
+        if not state.csms_info:
+            self.logger.error("CSMS info not found in Redis (ocpp-relay:csms_info)")
+            state.relay_configured = False
+            return False
+
+        # state.csms_info may already be a dict because of eval()
+        if isinstance(state.csms_info, dict):
+            csms_info = state.csms_info
+        else:
+            try:
+                import json
+                csms_info = json.loads(state.csms_info)
+            except Exception as e:
+                self.logger.error(f"Invalid CSMS info JSON in Redis: {e}")
+                state.relay_configured = False
+                return False
+
+        self.csms_url = csms_info.get("url", "")
+        self.csms_id = csms_info.get("id", "")
+        self.csms_pass = csms_info.get("pass", "")
+
+        if not self.csms_url:
+            self.logger.error("CSMS URL missing in Redis configuration")
+            state.relay_configured = False
+            return False
+
+        state.relay_configured = True
+
+        self.logger.info(f"Loaded CSMS config from Redis. URL={self.csms_url}")
+        return True
 
     async def _relay(self, source_ws, target_ws, source_name, target_name):
         while True:
@@ -116,6 +152,19 @@ class WebSocketRelay:
             self.logger.info(
                 f"Received a new connection from a ChargePoint. {charge_point_id=}"
             )
+
+            # POINT 1: guard
+            if not self.csms_url:
+                self.logger.error(
+                    "CSMS URL not set yet. Rejecting ChargePoint %s", charge_point_id
+                )
+                await cp_ws.close(code=1011, reason="CSMS not configured")
+                return
+
+            # POINT 2: correct URL composition
+            csms_uri = f"{self.csms_url}{charge_point_id}"
+            self.logger.info(f"Connecting to CSMS at {csms_uri}")
+
             self.logger.info(f"Connecting to CSMS at {self.csms_url}/{charge_point_id}")
             connection_meta_info = MetaInformation(
                 event="Connection",
@@ -142,6 +191,10 @@ class WebSocketRelay:
                 )
 
     async def start(self, port):
+        if not await self.load_csms_from_redis():
+            self.logger.error("Relay startup aborted: CSMS not configured")
+            return
+
         server = await websockets.serve(self.on_connect, "0.0.0.0", port)
         self.logger.info(f"Relay server started on {port}")
         await server.wait_closed()
